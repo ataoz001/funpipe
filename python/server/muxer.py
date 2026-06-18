@@ -1,0 +1,220 @@
+"""mews mux relay. Runs on the bastion inside one SSH session channel.
+
+Reads the mews stream-mux protocol on stdin/stdout (see mux.go). Each accepted
+stream's SYN payload is a "host port" destination (space-separated; bare IPv6
+literals need no bracket disambiguation); the relay dials it from the host
+netns, then splices bytes in both directions until close.
+
+Wire: type:u8 flags:u8 stream:u32-BE length:u16-BE  payload
+Types: 0=SYN(payload=destination) 1=DATA 2=WIN(u32 credit)
+Flags: 1=FIN (DATA only)
+
+FIN semantics: mux.go sends the same DATA|FIN for CloseWrite (half-close) and
+Close (full close), so the relay cannot tell them apart. We treat FIN as full
+close and abort the upstream->client writer too. Treating it as half-close
+instead wedges that writer forever once a closed client stops granting WIN.
+The cost: write-FIN-then-read-response is NOT supported. mews never does this
+(http.Transport and the WS splice hold streams open until done); revisit if
+the protocol ever grows a distinct RST frame.
+"""
+
+import os, socket, struct, threading, queue
+
+HDR = "!BBIH"
+SYN, DATA, WIN = 0, 1, 2
+FIN = 1
+MAX, INITIAL = 32_768, 256 * 1024
+# Safety caps. Client misuse is the client's problem, but the server must not
+# let a buggy or hostile client OOM the bastion (and thus other processes).
+# Invariant: a client honoring flow control has at most INITIAL/MAX = 8 frames
+# in flight per stream, so BACKLOG_MAX only trips on a protocol violation.
+STREAMS_MAX = 64    # concurrent streams per tunnel; cap on threads + sockets + memory
+BACKLOG_MAX = 16    # frames per stream; ~512KB worst case per stream
+
+
+class Mux:
+    def __init__(self, rfd, wfd):
+        self.rfd, self.wfd = rfd, wfd
+        self.wm = threading.Lock()
+        self.streams = {}
+        self.accept_q = queue.Queue()
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def frame(self, t, fl, sid, payload=b""):
+        mv = memoryview(struct.pack(HDR, t, fl, sid, len(payload)) + payload)
+        try:
+            with self.wm:
+                while mv:  # pipe writes beyond PIPE_BUF can be partial
+                    mv = mv[os.write(self.wfd, mv) :]
+        except OSError:
+            pass  # stdout gone: session is dead; read side will EOF and tear down
+
+    def retire(self, sid):
+        # serve() calls this on exit; frees a slot for STREAMS_MAX accounting.
+        self.streams.pop(sid, None)
+
+    def _readn(self, n):
+        buf = bytearray()
+        while len(buf) < n:  # os.read on a pipe returns short reads
+            try:
+                c = os.read(self.rfd, n - len(buf))
+            except OSError:
+                return None
+            if not c:
+                return None
+            buf += c
+        return bytes(buf)
+
+    def _read_loop(self):
+        try:
+            while (h := self._readn(8)) is not None:
+                t, fl, sid, ln = struct.unpack(HDR, h)
+                p = self._readn(ln) if ln else b""
+                if p is None:
+                    break
+                if t == SYN:
+                    if len(self.streams) >= STREAMS_MAX:
+                        # cap reached: refuse without registering. Client sees
+                        # immediate EOF on the stream's read side.
+                        self.frame(DATA, FIN, sid)
+                        continue
+                    s = self.streams[sid] = Stream(self, sid, p)
+                    self.accept_q.put(s)
+                    continue
+                # Unknown sid: silently drop. Could be a late frame for a
+                # retired stream, or a frame for a SYN we refused.
+                s = self.streams.get(sid)
+                if s is None:
+                    continue
+                if t == DATA:
+                    if p:
+                        s.push(p)
+                    if fl & FIN:
+                        s.push(None)
+                elif t == WIN:
+                    s.grant(struct.unpack("!I", p)[0])  # malformed = tunnel-fatal
+        finally:
+            for s in list(self.streams.values()):
+                s.push(None)
+            self.accept_q.put(None)
+
+
+class Stream:
+    def __init__(self, mux, sid, dest):
+        self.mux, self.id, self.dest = mux, sid, dest
+        self.rq = queue.Queue()
+        self.swin = INITIAL
+        self.cv = threading.Condition()
+        self.dead = False
+
+    def read(self):
+        # Frame payloads are <= u16 max, so chunks pass through whole; the
+        # WIN credit returned is exactly what the splice loop consumed.
+        c = self.rq.get()
+        if c is None:
+            return None
+        self.mux.frame(WIN, 0, self.id, struct.pack("!I", len(c)))
+        return c
+
+    def write(self, s):
+        o = 0
+        while o < len(s):
+            with self.cv:
+                while self.swin <= 0 and not self.dead:
+                    self.cv.wait()
+                if self.dead:
+                    # Client FIN'd (= closed, see module docstring): no more
+                    # WIN is coming. Raising (an OSError) breaks s2c's loop
+                    # instead of silently draining the upstream forever.
+                    raise BrokenPipeError(f"stream {self.id}: closed by client")
+                k = min(len(s) - o, self.swin, MAX)
+                self.swin -= k
+            self.mux.frame(DATA, 0, self.id, s[o : o + k])
+            o += k
+
+    def close_write(self):
+        self.mux.frame(DATA, FIN, self.id)
+
+    def grant(self, d):
+        with self.cv:
+            self.swin += d
+            self.cv.notify_all()
+
+    def push(self, c):
+        # None = EOF, always admitted; it also kills a writer parked on WIN
+        # credit that will never arrive. Data is subject to the hard backlog
+        # clamp: a well-behaved client stalls naturally at INITIAL (we stop
+        # sending WIN while c2s blocks on the upstream); this catches a client
+        # ignoring flow control. Tunnel-fatal on purpose.
+        if c is None:
+            self.rq.put(c)
+            with self.cv:
+                self.dead = True
+                self.cv.notify_all()
+            return
+        if self.rq.qsize() >= BACKLOG_MAX:
+            raise RuntimeError(f"stream {self.id}: backlog {self.rq.qsize()} >= {BACKLOG_MAX}")
+        self.rq.put(c)
+
+
+# Linux TCP_QUICKACK = 12. Without re-arming after each recv, the kernel's
+# delayed-ACK can hold for ~40ms; if the upstream is also Nagle-pinched it
+# stalls each response. Linux clears QUICKACK after the next ACK, so we
+# re-arm every time. Safe-noop everywhere else.
+_QUICKACK = getattr(socket, "TCP_QUICKACK", 12)
+
+def _quickack(sock):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, _QUICKACK, 1)
+    except OSError:
+        pass
+
+
+def serve(stream):
+    try:
+        host, _, port = stream.dest.decode("ascii").rpartition(" ")
+        sock = socket.create_connection((host, int(port)), timeout=10)
+    except (OSError, ValueError, UnicodeDecodeError):
+        stream.close_write()
+        stream.mux.retire(stream.id)
+        return
+    _quickack(sock)
+
+    def s2c():
+        try:
+            while data := sock.recv(65536):
+                stream.write(data)
+                _quickack(sock)
+        except OSError:
+            pass
+        stream.close_write()
+
+    def c2s():
+        try:
+            while data := stream.read():
+                sock.sendall(data)
+        except OSError:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    t1 = threading.Thread(target=s2c, daemon=True)
+    t1.start()
+    t2 = threading.Thread(target=c2s, daemon=True)
+    t2.start()
+    t1.join()
+    t2.join()
+    sock.close()
+    stream.mux.retire(stream.id)
+
+
+def main():
+    mux = Mux(0, 1)
+    while (s := mux.accept_q.get()) is not None:
+        threading.Thread(target=serve, args=(s,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
