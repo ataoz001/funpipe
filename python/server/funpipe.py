@@ -1,21 +1,34 @@
-"""mews mux relay. Runs on the bastion inside one SSH session channel.
+"""funpipe protocol: server side.
 
-Reads the mews stream-mux protocol on stdin/stdout (see mux.go). Each accepted
-stream's SYN payload is a "host port" destination (space-separated; bare IPv6
-literals need no bracket disambiguation); the relay dials it from the host
-netns, then splices bytes in both directions until close.
+Implements the server half of the funpipe stream-multiplexing protocol: reads
+the wire format off a pair of fds, and for each stream a peer opens, dials the
+requested destination and splices bytes both ways until close. It is a library
+first -- Mux/Stream/serve/run take their fds and their dialer as arguments, so
+the same code drives the CLI (run(0, 1) over an SSH session channel) and an
+embedding process (arbitrary fds, a custom dialer routing through a netns, a
+unix socket, or an allowlist). run() as a script entry point is just the
+default wiring.
+
+Each stream's SYN payload is a "host port" destination (space-separated; bare
+IPv6 literals need no bracket disambiguation), dialed by the injected dialer
+(default: a plain TCP connect from the current netns).
 
 Wire: type:u8 flags:u8 stream:u32-BE length:u16-BE  payload
 Types: 0=SYN(payload=destination) 1=DATA 2=WIN(u32 credit)
 Flags: 1=FIN (DATA only)
 
-FIN semantics: mux.go sends the same DATA|FIN for CloseWrite (half-close) and
-Close (full close), so the relay cannot tell them apart. We treat FIN as full
-close and abort the upstream->client writer too. Treating it as half-close
-instead wedges that writer forever once a closed client stops granting WIN.
-The cost: write-FIN-then-read-response is NOT supported. mews never does this
-(http.Transport and the WS splice hold streams open until done); revisit if
-the protocol ever grows a distinct RST frame.
+FIN semantics -- CLIENT-DEPENDENT, read before reusing. This server treats a
+DATA|FIN as a *full* close and tears down the upstream->client writer too. That
+is correct only against a client that does not distinguish half-close from
+close on the wire: the reference client (mews's mux.go) emits the same DATA|FIN
+for CloseWrite and Close, so the server genuinely cannot tell them apart, and
+treating FIN as half-close would wedge the upstream writer forever once a
+closed client stops granting WIN. The cost is that write-FIN-then-read-response
+(half-close request, then read the reply) is NOT supported. The reference
+callers never do this -- http.Transport and the WS splice hold streams open
+until done. A client that needs half-close must first grow a distinct RST (or
+separate shutdown) frame; until then, do not point a half-closing client at
+this server.
 """
 
 import os, socket, struct, threading, queue
@@ -38,7 +51,17 @@ class Mux:
         self.wm = threading.Lock()
         self.streams = {}
         self.accept_q = queue.Queue()
-        threading.Thread(target=self._read_loop, daemon=True).start()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+
+    def start(self):
+        # Separate from __init__ so a Mux can be constructed without touching
+        # its fds (tests, embedding). Call once.
+        self._reader.start()
+        return self
+
+    def accept(self):
+        # Blocks for the next SYN'd stream; None = tunnel closed.
+        return self.accept_q.get()
 
     def frame(self, t, fl, sid, payload=b""):
         mv = memoryview(struct.pack(HDR, t, fl, sid, len(payload)) + payload)
@@ -157,34 +180,26 @@ class Stream:
         self.rq.put(c)
 
 
-# Linux TCP_QUICKACK = 12. Without re-arming after each recv, the kernel's
-# delayed-ACK can hold for ~40ms; if the upstream is also Nagle-pinched it
-# stalls each response. Linux clears QUICKACK after the next ACK, so we
-# re-arm every time. Safe-noop everywhere else.
-_QUICKACK = getattr(socket, "TCP_QUICKACK", 12)
-
-def _quickack(sock):
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, _QUICKACK, 1)
-    except OSError:
-        pass
+def _dial(host, port):
+    return socket.create_connection((host, int(port)), timeout=10)
 
 
-def serve(stream):
+def serve(stream, dial=_dial):
+    # dial(host: str, port: str) -> socket-like with recv/sendall/shutdown/
+    # setsockopt/close. Injectable so embedders can route via a netns,
+    # a unix socket, or an allowlist. Must raise OSError/ValueError to refuse.
     try:
         host, _, port = stream.dest.decode("ascii").rpartition(" ")
-        sock = socket.create_connection((host, int(port)), timeout=10)
+        sock = dial(host, port)
     except (OSError, ValueError, UnicodeDecodeError):
         stream.close_write()
         stream.mux.retire(stream.id)
         return
-    _quickack(sock)
 
     def s2c():
         try:
             while data := sock.recv(65536):
                 stream.write(data)
-                _quickack(sock)
         except OSError:
             pass
         stream.close_write()
@@ -210,11 +225,35 @@ def serve(stream):
     stream.mux.retire(stream.id)
 
 
-def main():
-    mux = Mux(0, 1)
-    while (s := mux.accept_q.get()) is not None:
-        threading.Thread(target=serve, args=(s,), daemon=True).start()
+def run(rfd, wfd, dial=_dial):
+    # Library entry point: serve one tunnel over the given fds, blocking
+    # until the read side EOFs, then joining every serve() thread so upstream
+    # sockets are closed deterministically before we return (matters when
+    # embedded in a longer-lived process). Returns the Mux for inspection.
+    #
+    # On EOF the reader's finally-block push(None)s every live stream, which
+    # unblocks each serve()'s s2c/c2s, so these joins are bounded by in-flight
+    # upstream I/O, not indefinite. Threads stay daemon so a hung upstream
+    # can't wedge interpreter shutdown.
+    mux = Mux(rfd, wfd).start()
+    workers = []
+    while (s := mux.accept()) is not None:
+        t = threading.Thread(target=serve, args=(s, dial), daemon=True)
+        t.start()
+        # Prune finished threads so the list stays O(live streams), not
+        # O(streams ever served), on a long-lived high-churn tunnel.
+        workers = [w for w in workers if w.is_alive()]
+        workers.append(t)
+    for t in workers:
+        t.join()
+    return mux
 
+
+def main():
+    run(0, 1)
+
+
+__all__ = ["Mux", "Stream", "serve", "run", "SYN", "DATA", "WIN", "FIN", "HDR"]
 
 if __name__ == "__main__":
     main()
