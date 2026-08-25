@@ -181,7 +181,12 @@ class Stream:
 
 
 def _dial(host, port):
-    return socket.create_connection((host, int(port)), timeout=10)
+    sock = socket.create_connection((host, int(port)), timeout=10)
+    # In Python, but unlike Unix, the connect() timeout is further
+    # applied to read() and write() for that connection which breaks
+    # useful idle streams.
+    sock.settimeout(None)
+    return sock
 
 
 def serve(stream, dial=_dial):
